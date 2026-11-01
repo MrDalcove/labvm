@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# labvm — monta en VirtualBox las máquinas de laboratorio que descargas en .zip
+#
+#   labvm maquina.zip     monta ese .zip (lo busca aquí o en ~/Descargas; Tab completa)
+#   labvm                 vigila ~/Descargas y monta cada .zip nuevo que aparezca
+#   labvm -n nat ...      cambia la red (por defecto: bridged = adaptador puente)
+#                         opciones: bridged | nat | hostonly | intnet | original
+#
+# Ctrl+C → apaga y borra las VMs, sus carpetas y los .zip. No deja nada.
+
+set -uo pipefail
+
+DESCARGAS="${LABVM_DESCARGAS:-$HOME/Descargas}"
+RAIZ="${LABVM_RAIZ:-$HOME/VMs/labs}"
+RED="${LABVM_RED:-bridged}"
+DIRS=()            # carpetas de laboratorio creadas en esta sesión
+declare -A VISTOS  # zips ya procesados o ignorados
+
+c_ok=$'\e[32m'; c_info=$'\e[36m'; c_warn=$'\e[33m'; c_err=$'\e[31m'; c_0=$'\e[0m'
+info() { printf '\r\e[K%s▸%s %s\n' "$c_info" "$c_0" "$*"; }
+ok()   { printf '\r\e[K%s✔%s %s\n' "$c_ok" "$c_0" "$*"; }
+warn() { printf '\r\e[K%s!%s %s\n' "$c_warn" "$c_0" "$*"; }
+err()  { printf '\r\e[K%s✘%s %s\n' "$c_err" "$c_0" "$*" >&2; }
+
+uso() { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+ZIP_ARG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--red) RED="${2:-}"; shift 2 ;;
+    -h|--help) uso 0 ;;
+    -*) err "Opción no reconocida: $1"; uso 1 ;;
+    *)
+      ZIP_ARG=""
+      for c in "$1" "$1.zip" "$DESCARGAS/$1" "$DESCARGAS/$1.zip"; do
+        [[ -f "$c" ]] && { ZIP_ARG="$(realpath "$c")"; break; }
+      done
+      [[ -n "$ZIP_ARG" ]] || { err "No encuentro $1 (ni aquí ni en $DESCARGAS)"; exit 1; }
+      shift ;;
+  esac
+done
+[[ "$RED" == original ]] && RED=""
+case "$RED" in ""|nat|bridged|hostonly|intnet) ;; *) err "Red no válida: $RED"; exit 1 ;; esac
+
+command -v VBoxManage >/dev/null || { err "No encuentro VBoxManage"; exit 1; }
+command -v 7z >/dev/null || command -v unzip >/dev/null || { err "Necesito 7z o unzip"; exit 1; }
+mkdir -p "$RAIZ"
+RAIZ="$(realpath "$RAIZ")"
+
+# ---------------------------------------------------------------- limpieza
+vms_de_carpeta() {   # UUIDs de las VMs cuyo .vbox está dentro de la carpeta $1
+  local dir="$1" uuid cfg
+  VBoxManage list vms 2>/dev/null | sed -n 's/.*{\(.*\)}$/\1/p' | while read -r uuid; do
+    cfg="$(VBoxManage showvminfo "$uuid" --machinereadable 2>/dev/null | sed -n 's/^CfgFile="\(.*\)"$/\1/p')"
+    [[ -n "$cfg" && "$cfg" == "$dir"/* ]] && echo "$uuid"
+  done
+}
+
+borrar_vm() {
+  local uuid="$1" nombre i
+  nombre="$(VBoxManage showvminfo "$uuid" --machinereadable 2>/dev/null | sed -n 's/^name="\(.*\)"$/\1/p')"
+  info "Apagando y eliminando VM «${nombre:-$uuid}»"
+  VBoxManage controlvm "$uuid" poweroff >/dev/null 2>&1
+  for i in $(seq 30); do   # esperar a que suelte la sesión
+    VBoxManage showvminfo "$uuid" --machinereadable 2>/dev/null | grep -q '^SessionName=' || break
+    VBoxManage showvminfo "$uuid" --machinereadable 2>/dev/null | grep -q '^VMState="poweroff"\|^VMState="aborted"' && break
+    sleep 1
+  done
+  sleep 1
+  VBoxManage unregistervm "$uuid" --delete >/dev/null 2>&1 \
+    || VBoxManage unregistervm "$uuid" >/dev/null 2>&1
+}
+
+LIMPIANDO=0
+limpiar() {
+  (( LIMPIANDO )) && return
+  LIMPIANDO=1
+  trap '' INT TERM
+  printf '\r\e[K\n'
+  info "Ctrl+C recibido: limpiando todo…"
+  local d uuid
+  for d in "${DIRS[@]}"; do
+    for uuid in $(vms_de_carpeta "$d"); do borrar_vm "$uuid"; done
+    # seguridad: solo se borra si está dentro de $RAIZ
+    if [[ -n "$d" && "$d" == "$RAIZ"/?* && -d "$d" ]]; then
+      rm -rf -- "$d" && ok "Borrada carpeta $d (con el .zip dentro)"
+    fi
+  done
+  ok "Limpio. Hasta la próxima."
+  exit 0
+}
+trap limpiar INT TERM HUP
+
+# ---------------------------------------------------------------- utilidades
+spin_i=0
+spinner() {   # $1 = mensaje
+  local s='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  printf '\r\e[K%s%s%s %s' "$c_info" "${s:spin_i++%${#s}:1}" "$c_0" "$1"
+}
+
+descarga_completa() {   # tamaño estable y sin ficheros temporales del navegador
+  local f="$1" t1 t2
+  [[ -f "$f" ]] || return 1
+  [[ -e "$f.part" || -e "$f.crdownload" || -e "$f.download" ]] && return 1
+  t1=$(stat -c %s "$f"); sleep 2; t2=$(stat -c %s "$f" 2>/dev/null || echo -1)
+  [[ "$t1" == "$t2" && "$t1" -gt 0 ]]
+}
+
+extraer() {   # $1 archivo, $2 destino
+  if command -v 7z >/dev/null; then
+    7z x -y -bso0 -bsp1 -o"$2" "$1"
+  else
+    unzip -q -o "$1" -d "$2"
+  fi
+}
+
+buscar_vm() {   # imprime "tipo<TAB>ruta" del mejor candidato
+  local dir="$1" f ext
+  for ext in ova ovf vbox vmdk vdi vhd vhdx; do
+    f="$(find "$dir" -type f -iname "*.$ext" ! -path '*/__MACOSX/*' -printf '%s\t%p\n' 2>/dev/null \
+         | sort -rn | head -1 | cut -f2-)"
+    [[ -n "$f" ]] && { printf '%s\t%s\n' "$ext" "$f"; return 0; }
+  done
+  return 1
+}
+
+ajustar_red() {
+  local uuid="$1" ifz
+  [[ -z "$RED" ]] && return 0
+  case "$RED" in
+    nat)      VBoxManage modifyvm "$uuid" --nic1 nat ;;
+    intnet)   VBoxManage modifyvm "$uuid" --nic1 intnet --intnet1 labvm ;;
+    bridged)
+      ifz="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+      VBoxManage modifyvm "$uuid" --nic1 bridged --bridgeadapter1 "$ifz" ;;
+    hostonly)
+      ifz="$(VBoxManage list hostonlyifs | sed -n 's/^Name: *//p' | head -1)"
+      if [[ -z "$ifz" ]]; then
+        VBoxManage hostonlyif create >/dev/null 2>&1
+        ifz="$(VBoxManage list hostonlyifs | sed -n 's/^Name: *//p' | head -1)"
+      fi
+      VBoxManage modifyvm "$uuid" --nic1 hostonly --hostonlyadapter1 "$ifz" ;;
+  esac >/dev/null 2>&1 && info "Red: $RED" || warn "No pude poner la red en modo $RED"
+}
+
+# ---------------------------------------------------------------- montar un zip
+montar() {
+  local zip="$1" base dir tipo ruta nombre uuid
+  base="$(basename "$zip")"; base="${base%.*}"
+  nombre="$(tr -c 'A-Za-z0-9._-' '_' <<<"$base" | sed 's/_*$//')"
+  dir="$RAIZ/$nombre"
+  [[ -e "$dir" ]] && dir="$dir-$(date +%H%M%S)"
+
+  echo
+  info "Nuevo laboratorio: $c_ok$base$c_0"
+  mkdir -p "$dir/vm"
+  DIRS+=("$dir")
+  mv -- "$zip" "$dir/" || { err "No pude mover el zip"; return 1; }
+  zip="$dir/$(basename "$zip")"
+  ok "Carpeta $dir"
+
+  info "Descomprimiendo…"
+  extraer "$zip" "$dir/vm" || { err "Fallo al descomprimir"; return 1; }
+
+  if ! IFS=$'\t' read -r tipo ruta < <(buscar_vm "$dir/vm"); then
+    # ¿un comprimido dentro del comprimido?
+    local interno
+    interno="$(find "$dir/vm" -type f \( -iname '*.zip' -o -iname '*.7z' -o -iname '*.rar' -o -iname '*.tar*' \) | head -1)"
+    if [[ -n "$interno" ]]; then
+      info "Hay otro comprimido dentro, descomprimiendo $(basename "$interno")…"
+      extraer "$interno" "$dir/vm" && rm -f -- "$interno"
+    fi
+    IFS=$'\t' read -r tipo ruta < <(buscar_vm "$dir/vm") \
+      || { err "No encuentro ninguna máquina (.ova/.ovf/.vbox/.vmdk/.vdi/.vhd) en el zip"; return 1; }
+  fi
+  ok "Encontrado: ${ruta#"$dir"/vm/}"
+
+  case "$tipo" in
+    ova|ovf)
+      info "Importando en VirtualBox (puede tardar)…"
+      VBoxManage import "$ruta" --vsys 0 --vmname "$nombre" --basefolder "$dir" \
+        || { err "Falló la importación"; return 1; } ;;
+    vbox)
+      VBoxManage registervm "$ruta" || { err "No pude registrar $ruta"; return 1; } ;;
+    *)
+      info "Solo hay disco: creo una VM nueva con él (2 GB RAM, 2 CPU)"
+      VBoxManage createvm --name "$nombre" --ostype Linux_64 --basefolder "$dir" --register >/dev/null &&
+      uuid="$(vms_de_carpeta "$dir" | head -1)" &&
+      VBoxManage modifyvm "$uuid" --memory 2048 --cpus 2 --nic1 nat --ioapic on \
+        --graphicscontroller vmsvga --vram 32 &&
+      VBoxManage storagectl "$uuid" --name SATA --add sata --controller IntelAhci --portcount 2 &&
+      VBoxManage storageattach "$uuid" --storagectl SATA --port 0 --device 0 --type hdd --medium "$ruta" \
+        || { err "No pude crear la VM con el disco"; return 1; } ;;
+  esac
+
+  for uuid in $(vms_de_carpeta "$dir"); do
+    ajustar_red "$uuid"
+    VBoxManage startvm "$uuid" --type "${LABVM_TIPO:-gui}" >/dev/null 2>&1 \
+      && ok "VM arrancada" || warn "La VM está creada pero no arrancó (ábrela desde VirtualBox)"
+  done
+  ok "Laboratorio listo. ${c_warn}Ctrl+C${c_0} para borrarlo todo."
+}
+
+# ---------------------------------------------------------------- bucle principal
+for f in "$DESCARGAS"/*.zip "$DESCARGAS"/*.ZIP; do [[ -e "$f" ]] && VISTOS["$f"]=1; done
+
+if [[ -n "$ZIP_ARG" ]]; then
+  echo "${c_ok}labvm${c_0} · $(basename "$ZIP_ARG") · red ${RED:-original}"
+  montar "$ZIP_ARG" || warn "No se pudo montar; ${c_warn}Ctrl+C${c_0} para borrar lo creado."
+  while :; do
+    spinner "Laboratorio en marcha · ${c_warn}Ctrl+C${c_0} para apagar y borrar todo"
+    sleep 1
+  done
+fi
+
+echo "${c_ok}labvm${c_0} · vigilando $DESCARGAS · labs en $RAIZ · red ${RED:-original}"
+echo "Descarga un .zip con la VM. ${c_warn}Ctrl+C${c_0} = apagar y borrar todo."
+
+while :; do
+  for f in "$DESCARGAS"/*.zip "$DESCARGAS"/*.ZIP; do
+    [[ -e "$f" && -z "${VISTOS[$f]:-}" ]] || continue
+    spinner "Descargando $(basename "$f")…"
+    descarga_completa "$f" || continue
+    VISTOS["$f"]=1
+    montar "$f" || warn "Ese zip no se pudo montar; sigue en la carpeta del lab y se borrará al salir."
+  done
+  if (( ${#DIRS[@]} )); then
+    spinner "${#DIRS[@]} laboratorio(s) en marcha · Ctrl+C para terminar y borrar todo"
+  else
+    spinner "Esperando un .zip en $DESCARGAS…"
+  fi
+  sleep 1
+done
